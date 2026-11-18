@@ -1,0 +1,28 @@
+{
+  "base_url": {
+    "description": "ezBookkeeping 服务地址",
+    "hint": "填写实例根地址，例如 https://books.example.com 或 https://example.com/books，不含 /api/v1。",
+    "type": "string",
+    "default": ""
+  },
+  "api_token": {
+    "description": "ezBookkeeping API Token",
+    "hint": "在 ezBookkeeping 的用户设置 → 安全中生成。",
+    "type": "string",
+    "secret": true,
+    "default": ""
+  },
+  "timezone": {
+    "description": "记账时区",
+    "hint": "填写 IANA 时区名称，例如 Asia/Shanghai。",
+    "type": "string",
+    "default": "Asia/Shanghai"
+  },
+  "allowed_private_sessions": {
+    "description": "允许访问账本的私聊会话",
+    "hint": "填写 AstrBot 完整会话来源 UMO。留空时仅 AstrBot 管理员可在私聊使用。填写后仅列表中的私聊会话可用。",
+    "type": "list",
+    "_special": "umo",
+    "default": []
+  }
+}
