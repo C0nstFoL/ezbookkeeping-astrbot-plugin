@@ -1,7 +1,7 @@
 name: astrbot_plugin_ezbookkeeping
 display_name: ezBookkeeping 记账
 desc: 通过 AstrBot 自然语言对话新增收入、支出、转账和查询最近流水。
-version: v0.2.0
+version: v0.3.1
 author: C0nstFoL
 repo: https://github.com/C0nstFoL/ezbookkeeping-astrbot-plugin
 astrbot_version: ">=4.16,<5"

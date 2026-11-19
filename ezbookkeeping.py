@@ -2,7 +2,7 @@
 
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -14,6 +14,12 @@ TRANSACTION_TYPES = {"income": 2, "expense": 3, "transfer": 4}
 
 class BookkeepingError(Exception):
     """An error safe to show in chat."""
+
+
+class WriteOutcomeUnknown(BookkeepingError):
+    def __init__(self, reason: str):
+        super().__init__("写入结果未能确认，请先查询流水核实后再提交。")
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -83,7 +89,6 @@ class EzBookkeepingClient:
 
     async def request(self, method: str, endpoint: str, **kwargs):
         writing = method == "POST"
-        unknown = "写入结果未能确认，请先查询流水核实后再提交。"
         try:
             async with httpx.AsyncClient(
                 base_url=self.base_url,
@@ -96,11 +101,11 @@ class EzBookkeepingClient:
                 follow_redirects=False,
             ) as client:
                 response = await client.request(method, endpoint, **kwargs)
-        except httpx.RequestError:
+        except httpx.RequestError as error:
+            if writing:
+                raise WriteOutcomeUnknown(type(error).__name__) from None
             raise BookkeepingError(
-                unknown
-                if writing
-                else "无法连接 ezBookkeeping，请检查服务地址、网络和证书。"
+                "无法连接 ezBookkeeping，请检查服务地址、网络和证书。"
             ) from None
 
         if response.status_code in (401, 403):
@@ -108,7 +113,7 @@ class EzBookkeepingClient:
                 "ezBookkeeping 鉴权失败，请检查 API Token 和服务配置。"
             )
         if response.status_code >= 500 and writing:
-            raise BookkeepingError(unknown)
+            raise WriteOutcomeUnknown(f"HTTP {response.status_code}")
         try:
             payload = response.json()
         except ValueError:
@@ -126,31 +131,55 @@ class EzBookkeepingClient:
             or payload.get("success") is not True
             or "result" not in payload
         ):
-            raise BookkeepingError(
-                unknown if writing else "ezBookkeeping 返回了无法识别的响应。"
-            )
+            if writing:
+                raise WriteOutcomeUnknown(
+                    f"invalid API response (HTTP {response.status_code})"
+                )
+            raise BookkeepingError("ezBookkeeping 返回了无法识别的响应。")
         return payload["result"]
 
     @staticmethod
     def offset(moment: datetime) -> int:
         return int(moment.utcoffset().total_seconds() // 60)
 
-    def transaction_time(self, value: str) -> datetime:
+    def transaction_time(self, date_text: str, time_text: str = "") -> datetime:
         now = datetime.now(self.zone)
-        value = value.strip()
-        if not value or value == now.date().isoformat():
-            return now
+        date_text = date_text.strip()
+        time_text = time_text.strip()
         try:
-            if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+            if date_text and not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", date_text):
                 raise ValueError
-            moment = datetime.combine(date.fromisoformat(value), time(12), self.zone)
-            if moment.timestamp() < 1:
-                raise ValueError
-            return moment
+            day = date.fromisoformat(date_text) if date_text else now.date()
         except ValueError:
             raise BookkeepingError(
-                "交易日期请填写 YYYY-MM-DD，或留空使用当前时间。"
+                "交易日期请填写 YYYY-MM-DD，或留空使用今天。"
             ) from None
+
+        if not time_text and day == now.date():
+            return now
+        try:
+            if time_text and not re.fullmatch(
+                r"[0-9]{2}:[0-9]{2}(?::[0-9]{2})?", time_text
+            ):
+                raise ValueError
+            clock = time.fromisoformat(time_text) if time_text else time(12)
+        except ValueError:
+            raise BookkeepingError(
+                "交易时间请使用 24 小时制 HH:MM 或 HH:MM:SS。"
+            ) from None
+
+        moment = datetime.combine(day, clock, self.zone)
+        try:
+            if moment.timestamp() < 1:
+                raise ValueError
+            local = moment.astimezone(UTC).astimezone(self.zone)
+        except (ValueError, OverflowError, OSError):
+            raise BookkeepingError("交易日期或时间超出可用范围。") from None
+        if local.replace(tzinfo=None) != moment.replace(tzinfo=None):
+            raise BookkeepingError("该时间在记账时区不存在，请选择其他时间。")
+        if moment.utcoffset() != moment.replace(fold=1).utcoffset():
+            raise BookkeepingError("该时间在记账时区出现两次，请选择无歧义的时间。")
+        return moment
 
     async def accounts(self) -> list[LedgerItem]:
         data = await self.request("GET", "accounts/list.json")
@@ -203,7 +232,7 @@ class EzBookkeepingClient:
             or not transaction_id.isdecimal()
             or transaction_id == "0"
         ):
-            raise BookkeepingError("写入结果未能确认，请先查询流水核实后再提交。")
+            raise WriteOutcomeUnknown("missing or invalid transaction ID")
         return transaction_id
 
     async def recent(self, count: int) -> list[dict]:

@@ -13,6 +13,7 @@ from .ezbookkeeping import (
     TRANSACTION_TYPES,
     BookkeepingError,
     EzBookkeepingClient,
+    WriteOutcomeUnknown,
     amount_units,
     find_item,
     format_amount,
@@ -72,7 +73,7 @@ class EzBookkeepingPlugin(Star):
 
     @filter.llm_tool(name="ezbookkeeping_options")
     async def options(self, event: AstrMessageEvent, kind: str) -> str:
-        """当用户请求 ezBookkeeping 记账或查看可用账户与分类时使用。新增交易前先调用本工具查找真实 ID，并使用返回的本地日期解析今天、昨天等相对日期。
+        """当用户请求 ezBookkeeping 记账或查看可用账户与分类时使用。新增交易前先调用本工具查找真实 ID，并使用返回的本地日期和时间解析今天、昨天等相对时间表达。
 
         Args:
             kind(string): 交易类型，income 表示收入，expense 表示支出，transfer 表示转账。
@@ -84,9 +85,11 @@ class EzBookkeepingPlugin(Star):
             accounts, categories = await asyncio.gather(
                 client.accounts(), client.categories(kind)
             )
+            now = datetime.now(client.zone)
             return json.dumps(
                 {
-                    "today": datetime.now(client.zone).date().isoformat(),
+                    "today": now.date().isoformat(),
+                    "local_datetime": now.isoformat(timespec="seconds"),
                     "timezone": client.zone.key,
                     "accounts": [item.describe() for item in accounts],
                     "categories": [item.describe() for item in categories],
@@ -110,6 +113,7 @@ class EzBookkeepingPlugin(Star):
         destination_account_id: str = "",
         destination_amount: str = "",
         destination_currency: str = "",
+        time: str = "",
     ) -> AsyncGenerator[object, None]:
         """在 ezBookkeeping 新增一条收入、支出或转账。仅在用户表达实际记账意图时调用。账单描述、假设、讨论和引用均不能视为记账授权。先调用 ezbookkeeping_options 获取真实 ID。金额、账户或分类不明确时先询问。只有工具返回「已记账」才报告写入成功，写入结果未确认时先查流水。
 
@@ -119,7 +123,8 @@ class EzBookkeepingPlugin(Star):
             account_id(string): 现有账户的 ID。收入为收款账户，支出为付款账户，转账为转出账户。
             category_id(string): 与交易类型匹配的现有二级分类 ID。
             comment(string): 原交易说明，例如午餐。无说明时传空字符串。
-            date(string): 交易日期 YYYY-MM-DD。未指定时传空字符串。
+            date(string): 交易日期 YYYY-MM-DD。使用 ezbookkeeping_options 返回的本地日期解析今天、昨天等相对日期。未指定日期时留空，使用今天。
+            time(string): 用户指定的当地交易时间，24 小时制 HH:MM 或 HH:MM:SS，例如下午三点半传 15:30。用户指定时间时必须传入，未指定时留空。请根据配置时区理解时间，不明确时先询问。
             currency(string): 用户明确给出的原币种 ISO 代码，例如 CNY。未指定时传空字符串，由账户币种决定。
             destination_account_id(string): 转账的转入账户 ID。其他类型传空字符串。
             destination_amount(string): 转入金额。跨币种时必须由用户提供。同币种可传空字符串，沿用转出金额。
@@ -130,7 +135,7 @@ class EzBookkeepingPlugin(Star):
             if kind not in TRANSACTION_TYPES:
                 raise BookkeepingError("交易类型请选 income、expense 或 transfer。")
             source_amount = amount_units(amount)
-            when = client.transaction_time(date)
+            when = client.transaction_time(date, time)
             if len(comment) > 255:
                 raise BookkeepingError("交易说明最多 255 个字符。")
             accounts, categories = await asyncio.gather(
@@ -182,7 +187,10 @@ class EzBookkeepingPlugin(Star):
             elif destination_account_id or destination_amount or destination_currency:
                 raise BookkeepingError("只有转账可以填写转入参数。")
 
-            # Keep the same submission key when a provider repeats an identical tool call.
+            timestamp = int(when.timestamp())
+            # Explicit times distinguish otherwise identical entries in the same message.
+            # Without a time, keep the key stable across retries as the clock advances.
+            key_time = timestamp if time.strip() else when.date().isoformat()
             message_id = event.message_obj.message_id
             if message_id:
                 key = json.dumps(
@@ -190,19 +198,20 @@ class EzBookkeepingPlugin(Star):
                         event.unified_msg_origin,
                         event.get_sender_id(),
                         str(message_id),
-                        when.date().isoformat(),
+                        key_time,
                         payload,
                     ],
                     sort_keys=True,
                 )
                 payload["clientSessionId"] = hashlib.sha256(key.encode()).hexdigest()
-            payload.update(time=int(when.timestamp()), utcOffset=client.offset(when))
+            payload.update(time=timestamp, utcOffset=client.offset(when))
             async with self.write_lock:
                 transaction_id = await client.add(payload)
 
+            date_text = f"{when:%Y-%m-%d %H:%M:%S}"
             reply = (
                 f"已记账（编号 {transaction_id}）\n"
-                f"{when:%Y-%m-%d} {KIND_NAMES[TRANSACTION_TYPES[kind]]} · {category.name} · {detail}"
+                f"{date_text} {KIND_NAMES[TRANSACTION_TYPES[kind]]} · {category.name} · {detail}"
             )
             if kind == "transfer":
                 amount_line = (
@@ -228,7 +237,7 @@ class EzBookkeepingPlugin(Star):
                     rows=rows,
                     note=comment,
                     transaction_id=transaction_id,
-                    date_text=f"{when:%Y-%m-%d}",
+                    date_text=date_text,
                 )
                 if png:
                     yield event.chain_result([Image.fromBytes(png)])
@@ -236,6 +245,9 @@ class EzBookkeepingPlugin(Star):
                     # result so the final reply stage does not send it again.
                     event.clear_result()
             yield reply
+        except WriteOutcomeUnknown as error:
+            logger.warning(f"ezBookkeeping 写入结果未能确认（{error.reason}）")
+            yield str(error)
         except BookkeepingError as error:
             yield str(error)
 
@@ -270,7 +282,7 @@ class EzBookkeepingPlugin(Star):
                         money += f" → {target.get('name', '')} {format_amount(item['destinationAmount'])} {target.get('currency', '')}".rstrip()
                 comment = item.get("comment", "")
                 lines.append(
-                    f"{when:%Y-%m-%d} {kind} · {account.get('name', '')} · {money}"
+                    f"{when:%Y-%m-%d %H:%M:%S} {kind} · {account.get('name', '')} · {money}"
                     + (
                         f" · {comment}"
                         if comment and not item.get("hideAmount")
