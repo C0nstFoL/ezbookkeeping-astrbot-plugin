@@ -1,0 +1,11 @@
+wqy-microhei.ttc — WenQuanYi Micro Hei (文泉驿微米黑)
+
+Copyright (C) 2008-2009 WenQuanYi Project / Qianqian Fang and contributors.
+
+This font is distributed under the Apache License, Version 2.0, and is also
+available under the GNU General Public License version 3 with the font
+embedding exception. It is bundled here only so that the receipt images can
+render Chinese text without depending on system fonts.
+
+License: Apache License 2.0 — https://www.apache.org/licenses/LICENSE-2.0
+Project: https://wenq.org/  ·  https://github.com/anthonyfok/fonts-wqy-microhei

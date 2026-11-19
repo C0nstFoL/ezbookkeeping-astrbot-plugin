@@ -24,5 +24,11 @@
     "type": "list",
     "_special": "umo",
     "default": []
+  },
+  "send_receipt_image": {
+    "description": "记账成功后发送回执图片",
+    "hint": "开启后在一笔记账成功时额外发送一张账本风格的回执图片。关闭则只返回文字回执。",
+    "type": "bool",
+    "default": true
   }
 }

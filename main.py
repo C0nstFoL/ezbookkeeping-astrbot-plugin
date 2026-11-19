@@ -1,10 +1,12 @@
 import asyncio
 import hashlib
 import json
+from collections.abc import AsyncGenerator
 from datetime import datetime
 
-from astrbot.api import AstrBotConfig
+from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import Image
 from astrbot.api.star import Context, Star
 
 from .ezbookkeeping import (
@@ -15,6 +17,7 @@ from .ezbookkeeping import (
     find_item,
     format_amount,
 )
+from .receipt import render_receipt_png
 
 KIND_NAMES = {1: "余额调整", 2: "收入", 3: "支出", 4: "转账"}
 ACCESS_DENIED = "当前会话无权访问账本，请在授权的私聊中使用。"
@@ -25,6 +28,24 @@ class EzBookkeepingPlugin(Star):
         super().__init__(context)
         self.config = config
         self.write_lock = asyncio.Lock()
+        # (umo, transaction_id) of already-sent receipts, to avoid duplicate cards.
+        self._receipts_sent: dict[tuple[str, str], bool] = {}
+
+    def _claim_receipt(self, event: AstrMessageEvent, transaction_id: str) -> bool:
+        key = (event.unified_msg_origin, transaction_id)
+        if key in self._receipts_sent:
+            return False
+        self._receipts_sent[key] = True
+        if len(self._receipts_sent) > 500:
+            self._receipts_sent.pop(next(iter(self._receipts_sent)))
+        return True
+
+    async def _receipt_png(self, **kwargs) -> bytes | None:
+        try:
+            return await asyncio.to_thread(render_receipt_png, **kwargs)
+        except Exception:  # noqa: BLE001 - a failed image must never break bookkeeping
+            logger.warning("生成记账回执图片失败，已跳过图片。", exc_info=True)
+            return None
 
     def _client(self, event: AstrMessageEvent) -> EzBookkeepingClient:
         allowed = self.config.get("allowed_private_sessions", [])
@@ -89,7 +110,7 @@ class EzBookkeepingPlugin(Star):
         destination_account_id: str = "",
         destination_amount: str = "",
         destination_currency: str = "",
-    ) -> str:
+    ) -> AsyncGenerator[object, None]:
         """在 ezBookkeeping 新增一条收入、支出或转账。仅在用户表达实际记账意图时调用。账单描述、假设、讨论和引用均不能视为记账授权。先调用 ezbookkeeping_options 获取真实 ID。金额、账户或分类不明确时先询问。只有工具返回「已记账」才报告写入成功，写入结果未确认时先查流水。
 
         Args:
@@ -178,9 +199,45 @@ class EzBookkeepingPlugin(Star):
             payload.update(time=int(when.timestamp()), utcOffset=client.offset(when))
             async with self.write_lock:
                 transaction_id = await client.add(payload)
-            return f"已记账（编号 {transaction_id}）\n{when:%Y-%m-%d} {KIND_NAMES[TRANSACTION_TYPES[kind]]} · {category.name} · {detail}"
+
+            reply = (
+                f"已记账（编号 {transaction_id}）\n"
+                f"{when:%Y-%m-%d} {KIND_NAMES[TRANSACTION_TYPES[kind]]} · {category.name} · {detail}"
+            )
+            if kind == "transfer":
+                amount_line = (
+                    f"{format_amount(source_amount)} {account.currency} → "
+                    f"{format_amount(target_amount)} {target.currency}"
+                )
+                rows = [
+                    ("转出账户", account.name),
+                    ("转入账户", target.name),
+                    ("分类", category.name),
+                ]
+            else:
+                sign = "+" if kind == "income" else "-"
+                amount_line = f"{sign}{format_amount(source_amount)} {account.currency}"
+                rows = [("账户", account.name), ("分类", category.name)]
+
+            if self.config.get("send_receipt_image", True) and self._claim_receipt(
+                event, transaction_id
+            ):
+                png = await self._receipt_png(
+                    kind=KIND_NAMES[TRANSACTION_TYPES[kind]],
+                    amount=amount_line,
+                    rows=rows,
+                    note=comment,
+                    transaction_id=transaction_id,
+                    date_text=f"{when:%Y-%m-%d}",
+                )
+                if png:
+                    yield event.chain_result([Image.fromBytes(png)])
+                    # The card was sent as a direct tool message; clear the
+                    # result so the final reply stage does not send it again.
+                    event.clear_result()
+            yield reply
         except BookkeepingError as error:
-            return str(error)
+            yield str(error)
 
     @filter.llm_tool(name="ezbookkeeping_recent_transactions")
     async def recent_transactions(self, event: AstrMessageEvent, count: int = 5) -> str:
